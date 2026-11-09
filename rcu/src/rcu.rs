@@ -182,6 +182,29 @@ mod rcu_impl {
 
     pub struct RcuBox<T: 'static>(epoch::Atomic<T>);
 
+    impl<T> Drop for RcuBox<T> {
+        /// Free the current value. `epoch::Atomic` is a raw-pointer-like
+        /// cell with no `Drop` of its own, so without this every dropped
+        /// `RcuBox` leaked its value (org-zpr/zl-zipline#213). Values
+        /// replaced by `write()`/`update()` are not affected: they were
+        /// handed to `defer_destroy` when they were replaced.
+        fn drop(&mut self) {
+            // SAFETY: `&mut self` means no other reference to this box
+            // exists, and every `RcuGuard` borrows the box, so no reader
+            // can still hold the current value. Nothing else owns it: it
+            // is only ever unlinked by a swap in `write()`/`update()`,
+            // which then defers its destruction. The pointer is never null
+            // (`new()` stores a value and swaps only install new values),
+            // but check anyway rather than rely on that.
+            unsafe {
+                let current = self.0.load(Ordering::Acquire, epoch::unprotected());
+                if !current.is_null() {
+                    drop(current.into_owned());
+                }
+            }
+        }
+    }
+
     pub struct RcuGuard<'a, T: 'static> {
         guard: epoch::Guard,
         ptr: *const T,
@@ -497,6 +520,58 @@ impl<T> RcuBox<cslab::RcuCslabReader<T>> {
 #[cfg(test)]
 mod tests {
     use super::RcuBox;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A value that counts how many times it has been dropped.
+    struct DropCounter(Arc<AtomicUsize>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // The drop tests below expect the value to be dropped when the box is.
+    // They do not apply to `rcu-aarc`: its `AtomicArc` does free the value,
+    // but through `fast_smr` deferred reclamation (`AtomicArc::drop` retires
+    // a delayed decrement), so the drop happens later by design, not leaks.
+
+    fn counter() -> (Arc<AtomicUsize>, DropCounter) {
+        let count = Arc::new(AtomicUsize::new(0));
+        (count.clone(), DropCounter(count))
+    }
+
+    /// Dropping an `RcuBox` must drop the value it holds, exactly once.
+    /// The crossbeam-epoch backend wraps `crossbeam_epoch::Atomic`, which
+    /// has no `Drop`, so without an explicit `Drop` the value leaked; in ph
+    /// that leaked each torn-down peer's forwarding-table storage
+    /// (org-zpr/zl-zipline#213).
+    #[test]
+    #[cfg(not(feature = "rcu-aarc"))]
+    fn drop_frees_initial_value() {
+        let (count, value) = counter();
+        let rcu = RcuBox::new(value);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        drop(rcu);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    /// After a `write()`, dropping the box must drop the value written
+    /// last, exactly once. (The value it replaced is reclaimed by the
+    /// backend's own scheme, which for crossbeam-epoch is deferred and not
+    /// observable at a fixed point, so it is not asserted here.)
+    #[test]
+    #[cfg(not(feature = "rcu-aarc"))]
+    fn drop_frees_written_value() {
+        let (_, first) = counter();
+        let (count, second) = counter();
+        let rcu = RcuBox::new(first);
+        rcu.write(second);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        drop(rcu);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn guard_pins_value() {
