@@ -237,6 +237,13 @@ impl<T> CslabStorage<T> {
 
         // SAFETY: layout is not 0-sized
         let ptr = unsafe { alloc::alloc_zeroed(layout) };
+        // A failed allocation returns null. Every accessor builds slices from
+        // `ptr`, so a null one must never be stored: abort the standard way
+        // ("memory allocation of N bytes failed"). Reachable in practice on
+        // platforms that commit memory eagerly, such as Windows.
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
 
         #[cfg(loom)]
         {
@@ -781,6 +788,52 @@ impl<T> VacantEntry<'_, T> {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+
+    /// Environment variable that turns [alloc_failure_aborts_cleanly] into
+    /// the child process it spawns.
+    const ALLOC_FAILURE_CHILD: &str = "CSLAB_ALLOC_FAILURE_CHILD";
+
+    /// A capacity whose storage no machine can provide (about 64 TiB of
+    /// `u64` entries), yet small enough that its `Layout` is valid.
+    const IMPOSSIBLE_CAPACITY: usize = 1 << 43;
+
+    /// When the storage allocation fails, the slab must abort through the
+    /// standard `handle_alloc_error` path ("memory allocation of N bytes
+    /// failed"), never keep a null pointer and later build slices from it.
+    /// Windows commits memory eagerly, so this failure is reachable there in
+    /// practice: a null table pointer reached `slice::from_raw_parts` (UB).
+    ///
+    /// An abort cannot be observed in-process, so the test re-runs itself
+    /// as a child that performs the allocation and checks how it died.
+    #[test]
+    #[cfg(not(loom))]
+    fn alloc_failure_aborts_cleanly() {
+        if std::env::var_os(ALLOC_FAILURE_CHILD).is_some() {
+            let mut slab = Cslab::<u64>::with_fixed_capacity(IMPOSSIBLE_CAPACITY);
+            // Touch the table, as the first insert in a real caller would.
+            let _ = slab.insert(1);
+            unreachable!("allocating {IMPOSSIBLE_CAPACITY} entries succeeded");
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::alloc_failure_aborts_cleanly",
+                "--nocapture",
+            ])
+            .env(ALLOC_FAILURE_CHILD, "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "child must not succeed:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("memory allocation of"),
+            "child must abort through handle_alloc_error, got:\n{stderr}"
+        );
+    }
 
     // Compile-time check: thread-safe payloads keep the slab thread-safe
     // (guards against over-restricting the manual Send/Sync impls).
