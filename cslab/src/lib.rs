@@ -791,15 +791,56 @@ mod tests {
 
     /// Environment variable that turns [alloc_failure_aborts_cleanly] into
     /// the child process it spawns.
-    #[cfg(target_pointer_width = "64")]
     const ALLOC_FAILURE_CHILD: &str = "CSLAB_ALLOC_FAILURE_CHILD";
 
-    /// A capacity whose storage no machine can provide (about 64 TiB of
-    /// `u64` entries), yet small enough that its `Layout` is valid. Only
-    /// meaningful with 64-bit pointers: on 32-bit targets every valid
-    /// `Layout` may genuinely be allocatable, and `1 << 43` overflows.
-    #[cfg(target_pointer_width = "64")]
-    const IMPOSSIBLE_CAPACITY: usize = 1 << 43;
+    /// Allocations at least this large fail once [REFUSE_LARGE] is set.
+    const REFUSE_THRESHOLD: usize = 1 << 20;
+
+    /// Set by the child of [alloc_failure_aborts_cleanly] only; every other
+    /// test runs with the system allocator's normal behavior.
+    static REFUSE_LARGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Test-binary allocator: the system allocator, except that it returns
+    /// null for large requests once [REFUSE_LARGE] is set. This makes the
+    /// failure deterministic: an "impossibly large" request is not reliable,
+    /// because with memory overcommit a huge allocation can succeed.
+    struct RefusingAllocator;
+
+    // SAFETY: delegates to `System`, or returns null, which `GlobalAlloc`
+    // permits to signal allocation failure.
+    unsafe impl std::alloc::GlobalAlloc for RefusingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if self.refuses(layout) {
+                return std::ptr::null_mut();
+            }
+            // SAFETY: forwarded unchanged from our caller's contract.
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            if self.refuses(layout) {
+                return std::ptr::null_mut();
+            }
+            // SAFETY: forwarded unchanged from our caller's contract.
+            unsafe { std::alloc::System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: forwarded unchanged from our caller's contract.
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+    }
+
+    impl RefusingAllocator {
+        fn refuses(&self, layout: Layout) -> bool {
+            layout.size() >= REFUSE_THRESHOLD
+                && REFUSE_LARGE.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[cfg(not(loom))]
+    #[global_allocator]
+    static ALLOCATOR: RefusingAllocator = RefusingAllocator;
 
     /// When the storage allocation fails, the slab must abort through the
     /// standard `handle_alloc_error` path ("memory allocation of N bytes
@@ -808,15 +849,17 @@ mod tests {
     /// practice: a null table pointer reached `slice::from_raw_parts` (UB).
     ///
     /// An abort cannot be observed in-process, so the test re-runs itself
-    /// as a child that performs the allocation and checks how it died.
+    /// as a child that forces the allocation to fail and checks how it died.
     #[test]
-    #[cfg(all(not(loom), target_pointer_width = "64"))]
+    #[cfg(not(loom))]
     fn alloc_failure_aborts_cleanly() {
         if std::env::var_os(ALLOC_FAILURE_CHILD).is_some() {
-            let mut slab = Cslab::<u64>::with_fixed_capacity(IMPOSSIBLE_CAPACITY);
+            REFUSE_LARGE.store(true, std::sync::atomic::Ordering::Relaxed);
+            // Storage for this capacity is well over REFUSE_THRESHOLD.
+            let mut slab = Cslab::<u64>::with_fixed_capacity(REFUSE_THRESHOLD);
             // Touch the table, as the first insert in a real caller would.
             let _ = slab.insert(1);
-            unreachable!("allocating {IMPOSSIBLE_CAPACITY} entries succeeded");
+            unreachable!("the refused allocation succeeded");
         }
 
         let output = std::process::Command::new(std::env::current_exe().unwrap())
