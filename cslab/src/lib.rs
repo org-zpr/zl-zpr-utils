@@ -791,10 +791,14 @@ mod tests {
 
     /// Environment variable that turns [alloc_failure_aborts_cleanly] into
     /// the child process it spawns.
+    #[cfg(target_pointer_width = "64")]
     const ALLOC_FAILURE_CHILD: &str = "CSLAB_ALLOC_FAILURE_CHILD";
 
     /// A capacity whose storage no machine can provide (about 64 TiB of
-    /// `u64` entries), yet small enough that its `Layout` is valid.
+    /// `u64` entries), yet small enough that its `Layout` is valid. Only
+    /// meaningful with 64-bit pointers: on 32-bit targets every valid
+    /// `Layout` may genuinely be allocatable, and `1 << 43` overflows.
+    #[cfg(target_pointer_width = "64")]
     const IMPOSSIBLE_CAPACITY: usize = 1 << 43;
 
     /// When the storage allocation fails, the slab must abort through the
@@ -806,7 +810,7 @@ mod tests {
     /// An abort cannot be observed in-process, so the test re-runs itself
     /// as a child that performs the allocation and checks how it died.
     #[test]
-    #[cfg(not(loom))]
+    #[cfg(all(not(loom), target_pointer_width = "64"))]
     fn alloc_failure_aborts_cleanly() {
         if std::env::var_os(ALLOC_FAILURE_CHILD).is_some() {
             let mut slab = Cslab::<u64>::with_fixed_capacity(IMPOSSIBLE_CAPACITY);
